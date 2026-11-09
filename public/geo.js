@@ -7,6 +7,22 @@ const KY = 110574;
 export const toXY = (lon, lat) => [(lon - LON0) * KX, (lat - LAT0) * KY];
 export const toLonLat = (x, y) => [x / KX + LON0, y / KY + LAT0];
 
+export const HEX_WIDTH = 250;
+const HEX_SIDE = HEX_WIDTH / Math.sqrt(3);
+
+export const hexCenter = (q, r) => [HEX_SIDE * Math.sqrt(3) * (q + r / 2), HEX_SIDE * 1.5 * r];
+
+/** The corners of a hexagon, closed, as [[x, y], ...] in metres. */
+export function hexRing(q, r) {
+  const [cx, cy] = hexCenter(q, r);
+  const ring = [];
+  for (let k = 0; k <= 6; k++) {
+    const a = (Math.PI / 3) * k + Math.PI / 6;
+    ring.push([cx + HEX_SIDE * Math.cos(a), cy + HEX_SIDE * Math.sin(a)]);
+  }
+  return ring;
+}
+
 /** Builds a polyline with cumulative distance from [[x, y], ...]. */
 export function makeShape(points) {
   const clean = points.filter(
@@ -74,22 +90,6 @@ function projectOnSegment(shape, j, x, y) {
   const len2 = dx * dx + dy * dy || 1;
   const r = Math.min(1, Math.max(0, ((x - ax) * dx + (y - ay) * dy) / len2));
   return { r, dist: Math.hypot(x - ax - dx * r, y - ay - dy * r) };
-}
-
-/** Nearest place on the route to (x, y), favouring the pass closest to `expected` metres along a route that doubles back. */
-export function nearestAlong(shape, x, y, expected) {
-  let best = { along: 0, gap: Infinity };
-  let bestScore = Infinity;
-  for (let j = 0; j < shape.xs.length - 1; j++) {
-    const { r, dist } = projectOnSegment(shape, j, x, y);
-    const along = shape.cum[j] + (shape.cum[j + 1] - shape.cum[j]) * r;
-    const score = dist + Math.abs(along - expected) * 0.02;
-    if (score < bestScore) {
-      bestScore = score;
-      best = { along, gap: dist };
-    }
-  }
-  return best;
 }
 
 /**

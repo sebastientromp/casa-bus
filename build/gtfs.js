@@ -1,6 +1,6 @@
 import { existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { makeShape, projectStops, toXY } from './geo.js';
+import { makeShape, projectStops, toXY } from '../public/geo.js';
 import { readZip } from './zip.js';
 
 const ONE_DAY = 24 * 3600 * 1000;
@@ -11,15 +11,12 @@ export const NETWORKS = [
     id: 'envibus',
     label: 'Envibus',
     gtfs: 'https://open-share.agglo-casa.fr/s/34FS2SWg36NEZk4/download',
-    realtime: null,
     licence: 'ODbL',
   },
   {
     id: 'zou-prox',
     label: 'ZOU! Proximité',
     gtfs: 'https://www.datasud.fr/fr/dataset/datasets/3745/resource/5016/download/',
-    realtime: 'https://proxy-data.zou.maregionsud.fr/GTFS-RT/GTFS-RT_trips_ZOU_proximite.pb',
-    vehicles: 'https://www.data.gouv.fr/api/1/datasets/r/d4fa9ce6-5566-4529-a82e-74236a9c102e',
     licence: 'Licence Ouverte',
     onlyInDepartment: true,
   },
@@ -27,8 +24,6 @@ export const NETWORKS = [
     id: 'zou-exp',
     label: 'ZOU! Express',
     gtfs: 'https://www.datasud.fr/fr/dataset/datasets/3743/resource/5153/download/',
-    realtime: 'https://proxy-data.zou.maregionsud.fr/GTFS-RT/GTFS-RT_trips_ZOU_express.pb',
-    vehicles: 'https://www.data.gouv.fr/api/1/datasets/r/b8052ca8-271a-4145-a949-2e038a764a64',
     licence: 'Licence Ouverte',
     onlyInDepartment: true,
   },
@@ -36,7 +31,6 @@ export const NETWORKS = [
     id: 'zou-sco',
     label: 'ZOU! Scolaire',
     gtfs: 'https://www.data.gouv.fr/api/1/datasets/r/6471d334-17df-4308-bae0-5736c24a2e6a',
-    realtime: null,
     licence: 'Licence Ouverte',
     onlyInDepartment: true,
   },
@@ -44,38 +38,30 @@ export const NETWORKS = [
     id: 'lignes-azur',
     label: "Lignes d'Azur",
     gtfs: 'https://www.data.gouv.fr/api/1/datasets/r/f5678ab2-c863-4b48-ba1f-9021c7d97634',
-    realtime: 'https://ara-api.enroute.mobi/rla/gtfs/trip-updates',
-    vehicles: 'https://ara-api.enroute.mobi/rla/gtfs/vehicle-positions',
     licence: 'Licence Ouverte',
   },
   {
     id: 'palmbus',
     label: 'Palmbus',
     gtfs: 'https://www.data.gouv.fr/api/1/datasets/r/47bc8088-6c72-43ad-a959-a5bbdd1aa14f',
-    realtime: 'https://proxy.transport.data.gouv.fr/resource/palmbus-cannes-gtfs-rt-trip-update',
-    vehicles: 'https://proxy.transport.data.gouv.fr/resource/palmbus-cannes-gtfs-rt-vehicle-position',
     licence: 'Licence Ouverte',
   },
   {
-    // Its live feeds use trip IDs that aren't in its published timetable, so they can't be matched.
     id: 'zest',
     label: 'Zest',
     gtfs: 'https://www.data.gouv.fr/api/1/datasets/r/72609821-2459-47fb-a63b-3dbbc0d96c92',
-    realtime: null,
     licence: 'Licence Ouverte',
   },
   {
     id: 'sillages',
     label: 'Sillages',
     gtfs: 'https://www.data.gouv.fr/api/1/datasets/r/851decd7-714f-45ad-9579-d60c06fad9dd',
-    realtime: null,
     licence: 'Licence Ouverte',
   },
   {
     id: 'sillages-sco',
     label: 'Sillages Scolaire',
     gtfs: 'https://www.data.gouv.fr/api/1/datasets/r/1580b34b-8ebe-42b1-b75c-a4ae41d579b7',
-    realtime: null,
     licence: 'Licence Ouverte',
   },
 ];
@@ -166,15 +152,6 @@ function parisOffsetMs(epochMs) {
 }
 
 /** Paris calendar date of an instant, as 'YYYYMMDD'. */
-export function parisDate(epochMs) {
-  const d = new Date(epochMs + parisOffsetMs(epochMs));
-  return (
-    String(d.getUTCFullYear()) +
-    String(d.getUTCMonth() + 1).padStart(2, '0') +
-    String(d.getUTCDate()).padStart(2, '0')
-  );
-}
-
 export function shiftDate(ymd, days) {
   const d = new Date(Date.UTC(+ymd.slice(0, 4), +ymd.slice(4, 6) - 1, +ymd.slice(6, 8) + days));
   return (
@@ -189,11 +166,6 @@ export function serviceOrigin(ymd) {
   const guess = Date.UTC(+ymd.slice(0, 4), +ymd.slice(4, 6) - 1, +ymd.slice(6, 8), 12);
   const noon = guess - parisOffsetMs(guess);
   return noon - 12 * 3600 * 1000;
-}
-
-/** The service day a moment belongs to; it rolls over at 03:00, before the first buses. */
-export function currentServiceDate(epochMs) {
-  return parisDate(epochMs - 3 * 3600 * 1000);
 }
 
 export function isServiceActive(calendar, serviceId, ymd) {
@@ -236,7 +208,7 @@ function lineColor(raw) {
     : '#8a93a6';
 }
 
-/** Downloads any feed that is missing or older than a day; a failed refresh keeps the last copy. */
+/** Downloads any timetable that is missing or older than a day; a failed refresh keeps the last copy. */
 export async function ensureFeeds(dataDir, log = console.log) {
   mkdirSync(dataDir, { recursive: true });
   for (const net of NETWORKS) {
@@ -284,6 +256,11 @@ function readCalendar(read) {
   return { rules, exceptions };
 }
 
+/** Coordinates are kept to 1e-5 degrees, so the browser rebuilds exactly the same route lengths. */
+function fixedXY(lon, lat) {
+  return toXY(Math.round(lon * 1e5) / 1e5, Math.round(lat * 1e5) / 1e5);
+}
+
 function readShapes(read) {
   const groups = new Map();
   for (const row of read('shapes.txt')) {
@@ -293,7 +270,7 @@ function readShapes(read) {
   const shapes = new Map();
   for (const [id, pts] of groups) {
     pts.sort((a, b) => a[0] - b[0]);
-    shapes.set(id, makeShape(pts.map(([, lon, lat]) => toXY(lon, lat))));
+    shapes.set(id, makeShape(pts.map(([, lon, lat]) => fixedXY(lon, lat))));
   }
   return shapes;
 }
@@ -313,7 +290,7 @@ export function loadAll(dataDir, log = console.log) {
     const stopXY = new Map();
     const stopsInDepartment = new Set();
     for (const s of stopRows) {
-      stopXY.set(s.stop_id, toXY(+s.stop_lon, +s.stop_lat));
+      stopXY.set(s.stop_id, fixedXY(+s.stop_lon, +s.stop_lat));
       if (inAlpesMaritimes(+s.stop_lon, +s.stop_lat)) stopsInDepartment.add(s.stop_id);
     }
 
@@ -408,8 +385,6 @@ export function loadAll(dataDir, log = console.log) {
       });
 
       model.trips.push({
-        index: model.trips.length,
-        key: `${net.id}:${t.trip_id}`,
         net: net.id,
         serviceId: t.service_id,
         line: lineIndex.get(lineKey),
@@ -419,8 +394,6 @@ export function loadAll(dataDir, log = console.log) {
         dep: Int32Array.from(dep),
         dist,
         stops: Int32Array.from(stopIndices),
-        seq: Int32Array.from(rows.map((r) => Number(r.stop_sequence))),
-        gtfsStops: rows.map((r) => r.stop_id),
       });
       kept++;
     }

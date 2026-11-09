@@ -1,13 +1,12 @@
-import { nextDeparture } from '/replay.js';
+import { hexRing, toLonLat } from './geo.js';
+import { dayOf, decodeShapes, decodeTimetable, loadGz, nextDeparture, serviceDateOf, shiftYmd, vehiclesAt } from './schedule.js';
 
 const VALBONNE = [7.0086, 43.6417];
 const MIN_SKIP_MS = 15 * 60 * 1000;
 const SKIP_NOTE_MS = 2500;
-const VEHICLE_MS = 5000;
-const REPORTED_TWEEN_MS = 30000;
-const BUSY_MAP_BUSES = 400;
-const SERVICE_MS = 30000;
-const MAX_TWEEN_METRES = 2000;
+const COLOUR_EVERY_MS = 1000;
+const COLOUR_MIN_SIM_MS = 30000;
+const BUSY_MAP_VEHICLES = 400;
 const ZERO_ROAD = '#343b4d';
 
 // One hue, dim to bright, so the most-served roads stand out against the dark map.
@@ -16,7 +15,7 @@ const BREAKS = {
   day: { roads: [1, 10, 25, 50, 100, 200, 400], areas: [1, 20, 50, 100, 200, 400, 800] },
   hour: { roads: [1, 2, 4, 8, 12, 20, 35], areas: [1, 4, 8, 15, 30, 50, 100] },
 };
-const WINDOW_TEXT = { today: 'today so far', hour: 'in the last hour', full: 'in the full day' };
+const WINDOW_TEXT = { today: 'that day so far', hour: 'in the last hour', full: 'in the full day' };
 
 const state = {
   window: 'today',
@@ -26,34 +25,30 @@ const state = {
   openNetworks: new Set(['envibus']),
   roadValues: [],
   areaValues: [],
-  buses: new Map(),
+  vehicles: new Map(),
   popup: null,
-  popupBusId: null,
-  serviceRequest: 0,
-  liveOnly: false,
-  latestVehicles: null,
-  replay: {
-    on: false,
-    playing: true,
-    speed: 300,
-    skipEmpty: true,
-    skipNote: '',
-    skipNoteUntil: 0,
-    sim: 0,
-    lastTick: 0,
-    shapes: null,
-    shapesRequested: false,
-    days: new Map(),
-    loading: new Set(),
-    retryAt: 0,
-    lastColour: 0,
-    lastColourSim: 0,
-    colouring: false,
-  },
+  popupVehicleId: null,
+  timetable: null,
+  shapes: null,
+  days: new Map(),
+  worker: null,
+  workerReady: false,
+  colouring: false,
+  colourAgain: false,
+  roadRequests: new Map(),
+  nextRoadRequest: 1,
+  playing: true,
+  speed: 300,
+  skipEmpty: true,
+  skipNote: '',
+  skipNoteUntil: 0,
+  sim: 0,
+  lastTick: 0,
+  lastColour: 0,
+  lastColourSim: -Infinity,
 };
 
 const $ = (id) => document.getElementById(id);
-const reduceMotion = matchMedia('(prefers-reduced-motion: reduce)').matches;
 
 const map = new maplibregl.Map({
   container: 'map',
@@ -66,7 +61,7 @@ map.addControl(new maplibregl.NavigationControl({ showCompass: false }), 'top-ri
 map.addControl(
   new maplibregl.AttributionControl({
     compact: false,
-    customAttribution: "Bus data: Envibus (ODbL), ZOU!, Lignes d'Azur, Palmbus, Zest, Sillages (Licence Ouverte), My Bus Finder",
+    customAttribution: "Timetables: Envibus (ODbL), ZOU!, Lignes d'Azur, Palmbus, Zest, Sillages (Licence Ouverte)",
   }),
 );
 
@@ -104,287 +99,54 @@ function applyColourScale() {
   renderLegend();
 }
 
-function allSelected() {
-  return state.selected.size === state.lines.length;
-}
-
-function linesQuery() {
-  if (allSelected()) return '';
-  const indices = state.lines.flatMap((l, i) => (state.selected.has(l.key) ? [i] : []));
-  return `&lines=${indices.join(',')}`;
+function selectedLineNumbers() {
+  if (state.selected.size === state.lines.length) return null;
+  return state.lines.flatMap((l, i) => (state.selected.has(l.key) ? [i] : []));
 }
 
 function applyValues(source, previous, next) {
   for (let id = 0; id < next.length; id++) {
-    if (previous[id] !== next[id]) map.setFeatureState({ source, id }, { n: next[id] });
+    if ((previous[id] ?? 0) !== next[id]) map.setFeatureState({ source, id }, { n: next[id] });
   }
 }
 
-function momentQuery() {
-  return state.replay.on ? `&at=${Math.round(state.replay.sim)}` : '';
-}
-
-async function refreshService() {
-  const request = ++state.serviceRequest;
-  try {
-    const res = await fetch(`/api/service?window=${state.window}${linesQuery()}${momentQuery()}`);
-    if (!res.ok) throw new Error(res.statusText);
-    const data = await res.json();
-    if (request !== state.serviceRequest) return;
-    applyValues('roads', state.roadValues, data.roads);
-    applyValues('areas', state.areaValues, data.areas);
-    state.roadValues = data.roads;
-    state.areaValues = data.areas;
-  } catch (err) {
-    console.warn('Service colouring not updated:', err.message);
-  }
-}
-
-function ringColour(hex) {
-  const n = parseInt(hex.slice(1), 16);
-  const channels = [(n >> 16) & 255, (n >> 8) & 255, n & 255];
-  const luminance = 0.2126 * channels[0] + 0.7152 * channels[1] + 0.0722 * channels[2];
-  if (luminance >= 90) return hex;
-  const mixed = channels.map((c) => Math.round(c + (255 - c) * 0.5));
-  return `rgb(${mixed.join(',')})`;
-}
-
-function metresBetween(a, b) {
-  const kx = 80500;
-  const ky = 110574;
-  return Math.hypot((a.lon - b.lon) * kx, (a.lat - b.lat) * ky);
-}
-
-function delayText(delay) {
-  if (delay === null || delay === undefined) return '';
-  const minutes = Math.round(Math.abs(delay) / 60);
-  if (minutes === 0) return 'on time';
-  return `${minutes} min ${delay > 0 ? 'late' : 'early'}`;
-}
-
-function busPopupHtml(v) {
-  const status = {
-    reported: `Reported position, ${v.age} s old${v.delay === null ? '' : `. ${delayText(v.delay)}`}`,
-    live: `Live delay: ${delayText(v.delay)}`,
-    scheduled: 'Timetable position; real position unknown',
-  }[v.status];
-  return `<div class="popup-title"><span class="popup-line" style="background:${v.color};color:${v.text}">${escapeHtml(v.short)}</span>${escapeHtml(v.headsign)}</div><div class="popup-sub">${status}</div>`;
-}
-
-function renderStatus(data) {
-  const el = $('status');
-  const failing = data.feeds.filter((f) => !f.ok);
-  el.classList.toggle('warn', failing.length > 0);
-  $('reported-count').textContent = data.reported ? `${data.reported} now` : 'none right now';
-  if (data.vehicles.length === 0) {
-    el.textContent = 'No buses running right now.';
+function refreshColours() {
+  if (!state.workerReady) return;
+  if (state.colouring) {
+    state.colourAgain = true;
     return;
   }
-  if (state.liveOnly && data.reported + data.live === 0) {
-    el.textContent = `No live buses right now. ${data.scheduled} scheduled are hidden.`;
-    return;
-  }
-  const counts = `${data.reported ? `${data.reported} reported, ` : ''}${data.live} live, ${data.scheduled} scheduled`;
-  if (failing.length) {
-    el.textContent = `${counts}. ${failing.map((f) => f.label).join(' and ')} feed unavailable: showing timetable.`;
-    return;
-  }
-  const age = Math.max(...data.feeds.map((f) => f.ageSeconds ?? 0));
-  el.textContent = `${counts}. Live data ${age} s old.`;
+  state.colouring = true;
+  state.lastColourSim = state.sim;
+  state.worker.postMessage({ type: 'score', at: Math.round(state.sim), window: state.window, lines: selectedLineNumbers() });
 }
 
-async function refreshVehicles() {
-  if (state.replay.on) return;
-  try {
-    const res = await fetch('/api/vehicles');
-    if (!res.ok) throw new Error(res.statusText);
-    const data = await res.json();
-    if (state.replay.on) return;
-    const now = performance.now();
-    const seen = new Set();
-    for (const v of data.vehicles) {
-      seen.add(v.id);
-      const bus = state.buses.get(v.id);
-      if (!bus) {
-        state.buses.set(v.id, { ...v, fromLon: v.lon, fromLat: v.lat, toLon: v.lon, toLat: v.lat, start: now, shownLon: v.lon, shownLat: v.lat });
-        continue;
-      }
-      // A reported position repeats until the next one arrives; let the glide finish.
-      if (v.status === 'reported' && bus.status === 'reported' && bus.toLon === v.lon && bus.toLat === v.lat) {
-        Object.assign(bus, v);
-        continue;
-      }
-      const jump = metresBetween({ lon: bus.shownLon, lat: bus.shownLat }, v) > MAX_TWEEN_METRES;
-      Object.assign(bus, v, {
-        fromLon: jump ? v.lon : bus.shownLon,
-        fromLat: jump ? v.lat : bus.shownLat,
-        toLon: v.lon,
-        toLat: v.lat,
-        start: now,
-        duration: v.status === 'reported' ? REPORTED_TWEEN_MS : VEHICLE_MS,
-      });
+function onWorkerMessage({ data: message }) {
+  if (message.type === 'ready') {
+    state.workerReady = true;
+    refreshColours();
+  } else if (message.type === 'score') {
+    applyValues('roads', state.roadValues, message.roads);
+    applyValues('areas', state.areaValues, message.areas);
+    state.roadValues = message.roads;
+    state.areaValues = message.areas;
+    state.colouring = false;
+    if (state.colourAgain) {
+      state.colourAgain = false;
+      refreshColours();
     }
-    for (const id of state.buses.keys()) if (!seen.has(id)) state.buses.delete(id);
-    if (state.popupBusId) {
-      const bus = state.buses.get(state.popupBusId);
-      if (bus) state.popup.setHTML(busPopupHtml(bus));
-      else state.popup.remove();
-    }
-    state.latestVehicles = data;
-    renderStatus(data);
-  } catch (err) {
-    $('status').textContent = 'Lost contact with the local server. Retrying...';
-    $('status').classList.add('warn');
+  } else if (message.type === 'piece') {
+    const lngLat = state.roadRequests.get(message.request);
+    state.roadRequests.delete(message.request);
+    if (lngLat) showRoad(message.detail, lngLat);
+  } else if (message.type === 'error') {
+    console.warn('Colouring failed:', message.message);
+    state.colouring = false;
   }
 }
 
-function drawBuses(now) {
-  const features = [];
-  const trails = [];
-  for (const bus of state.buses.values()) {
-    const r = reduceMotion ? 1 : Math.min(1, (now - bus.start) / (bus.duration ?? VEHICLE_MS));
-    bus.shownLon = bus.fromLon + (bus.toLon - bus.fromLon) * r;
-    bus.shownLat = bus.fromLat + (bus.toLat - bus.fromLat) * r;
-    const scheduled = bus.status === 'scheduled';
-    if (!state.selected.has(bus.line) || (state.liveOnly && scheduled && !state.replay.on)) {
-      if (bus.id === state.popupBusId) state.popup.remove();
-      continue;
-    }
-    if (bus.trail) {
-      trails.push({
-        type: 'Feature',
-        geometry: { type: 'LineString', coordinates: [...bus.trail, [bus.shownLon, bus.shownLat]] },
-        properties: { colour: ringColour(bus.color) },
-      });
-    }
-    features.push({
-      type: 'Feature',
-      id: features.length,
-      geometry: { type: 'Point', coordinates: [bus.shownLon, bus.shownLat] },
-      properties: {
-        id: bus.id,
-        short: bus.short,
-        reported: bus.status === 'reported',
-        fill: scheduled ? '#14171f' : bus.color,
-        ring: scheduled ? ringColour(bus.color) : '#ffffff',
-        label: scheduled ? '#ffffff' : bus.text,
-        bearing: bus.bearing,
-      },
-    });
-    if (bus.id === state.popupBusId) state.popup.setLngLat([bus.shownLon, bus.shownLat]);
-  }
-  map.getSource('buses').setData({ type: 'FeatureCollection', features });
-  map.getSource('trails').setData({ type: 'FeatureCollection', features: trails });
-}
-
-const parisDay = new Intl.DateTimeFormat('en-CA', { timeZone: 'Europe/Paris', year: 'numeric', month: '2-digit', day: '2-digit' });
-const parisClock = new Intl.DateTimeFormat('en-GB', { timeZone: 'Europe/Paris', weekday: 'short', day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit' });
-
-// Same rule as the server: a service day runs from 03:00 to 03:00.
-function serviceDateOf(ms) {
-  return parisDay.format(ms - 3 * 3600 * 1000).replaceAll('-', '');
-}
-
-function shiftYmd(ymd, days) {
-  const d = new Date(Date.UTC(+ymd.slice(0, 4), +ymd.slice(4, 6) - 1, +ymd.slice(6, 8) + days));
-  return d.toISOString().slice(0, 10).replaceAll('-', '');
-}
-
-function toInputValue(ms) {
-  return new Date(ms - new Date(ms).getTimezoneOffset() * 60000).toISOString().slice(0, 16);
-}
-
-function lowerIndex(values, target) {
-  let lo = 0;
-  let hi = values.length - 1;
-  while (hi - lo > 1) {
-    const mid = (lo + hi) >> 1;
-    if (values[mid] <= target) lo = mid;
-    else hi = mid;
-  }
-  return lo;
-}
-
-function placeOnShape(shape, metres) {
-  const i = lowerIndex(shape.m, metres);
-  const [lon0, lat0] = shape.c[i];
-  const [lon1, lat1] = shape.c[i + 1] ?? shape.c[i];
-  const r = Math.min(1, Math.max(0, (metres - shape.m[i]) / (shape.m[i + 1] - shape.m[i] || 1)));
-  const bearing = (Math.atan2((lon1 - lon0) * 0.7236, lat1 - lat0) * 180) / Math.PI;
-  return { lon: lon0 + (lon1 - lon0) * r, lat: lat0 + (lat1 - lat0) * r, bearing: (bearing + 360) % 360 };
-}
-
-function loadReplayDay(date) {
-  const replay = state.replay;
-  if (replay.days.has(date) || replay.loading.has(date) || performance.now() < replay.retryAt) return;
-  replay.loading.add(date);
-  fetch(`/api/timetable?date=${date}`)
-    .then((res) => {
-      if (!res.ok) throw new Error(res.statusText);
-      return res.json();
-    })
-    .then((day) => replay.days.set(date, day))
-    .catch((err) => {
-      console.warn('Timetable not loaded:', err.message);
-      replay.retryAt = performance.now() + 5000;
-    })
-    .finally(() => replay.loading.delete(date));
-}
-
-function loadReplayShapes() {
-  const replay = state.replay;
-  if (replay.shapesRequested) return;
-  replay.shapesRequested = true;
-  fetch('/api/shapes')
-    .then((res) => {
-      if (!res.ok) throw new Error(res.statusText);
-      return res.json();
-    })
-    .then((shapes) => {
-      replay.shapes = shapes;
-    })
-    .catch((err) => {
-      console.warn('Routes not loaded:', err.message);
-      replay.shapesRequested = false;
-    });
-}
-
-function replayedBuses(dates) {
-  const replay = state.replay;
-  const buses = new Map();
-  for (const date of dates) {
-    const day = replay.days.get(date);
-    const t = (replay.sim - day.origin) / 1000;
-    day.trips.forEach((trip, index) => {
-      if (trip.t.length < 2 || t < trip.t[0] || t > trip.t[trip.t.length - 1]) return;
-      const i = lowerIndex(trip.t, t);
-      const metres = trip.d[i] + ((trip.d[i + 1] - trip.d[i]) * (t - trip.t[i])) / (trip.t[i + 1] - trip.t[i] || 1);
-      const { lon, lat, bearing } = placeOnShape(replay.shapes[trip.s], metres);
-      const line = state.lines[trip.l];
-      const id = `${date}|${index}`;
-      buses.set(id, {
-        id,
-        line: line.key,
-        short: line.short,
-        color: line.color,
-        text: line.text,
-        headsign: trip.h,
-        status: 'scheduled',
-        delay: null,
-        age: null,
-        trail: null,
-        bearing: Math.round(bearing),
-        fromLon: lon,
-        fromLat: lat,
-        toLon: lon,
-        toLat: lat,
-        start: -Infinity,
-        shownLon: lon,
-        shownLat: lat,
-      });
-    });
-  }
-  return buses;
+function vehiclePopupHtml(v) {
+  return `<div class="popup-title"><span class="popup-line" style="background:${v.color};color:${v.text}">${escapeHtml(v.short)}</span>${escapeHtml(v.headsign)}</div><div class="popup-sub">Position from the timetable</div>`;
 }
 
 function setStatusText(text, warn = false) {
@@ -393,94 +155,99 @@ function setStatusText(text, warn = false) {
   el.classList.toggle('warn', warn);
 }
 
-function anyBusShown() {
-  for (const bus of state.buses.values()) if (state.selected.has(bus.line)) return true;
-  return false;
-}
-
-function skipToNextDeparture(now, dates, tomorrow) {
-  const replay = state.replay;
-  const loaded = [...dates, tomorrow].flatMap((date) => replay.days.get(date) ?? []);
-  const next = nextDeparture(loaded, replay.sim, (trip) => state.selected.has(state.lines[trip.l].key));
-  if (next === null || next - replay.sim < MIN_SKIP_MS) return;
-  replay.sim = next + 1;
-  replay.skipNote = `Skipped to ${parisClock.format(replay.sim)}: no buses until then.`;
-  replay.skipNoteUntil = now + SKIP_NOTE_MS;
-  state.buses = replayedBuses(dates.includes(serviceDateOf(replay.sim)) ? dates : [dates[1], tomorrow]);
-}
-
-function tickReplay(now) {
-  const replay = state.replay;
-  const elapsed = Math.min(now - replay.lastTick, 250);
-  replay.lastTick = now;
-
-  const today = serviceDateOf(replay.sim);
-  const dates = [shiftYmd(today, -1), today];
-  dates.forEach(loadReplayDay);
-  loadReplayShapes();
-  if (!replay.shapes || !dates.every((d) => replay.days.has(d))) {
-    setStatusText('Loading the timetable...');
-    return;
+function drawVehicles() {
+  const features = [];
+  for (const vehicle of state.vehicles.values()) {
+    if (!state.selected.has(vehicle.line)) {
+      if (vehicle.id === state.popupVehicleId) state.popup.remove();
+      continue;
+    }
+    features.push({
+      type: 'Feature',
+      id: features.length,
+      geometry: { type: 'Point', coordinates: [vehicle.lon, vehicle.lat] },
+      properties: { id: vehicle.id, short: vehicle.short, fill: vehicle.color, label: vehicle.text, bearing: vehicle.bearing },
+    });
+    if (vehicle.id === state.popupVehicleId) state.popup.setLngLat([vehicle.lon, vehicle.lat]);
   }
-  const tomorrow = shiftYmd(today, 1);
-  loadReplayDay(tomorrow);
-  const keep = new Set([...dates, tomorrow]);
-  for (const date of replay.days.keys()) if (!keep.has(date)) replay.days.delete(date);
+  map.getSource('vehicles').setData({ type: 'FeatureCollection', features });
+}
 
-  if (replay.playing) replay.sim += elapsed * replay.speed;
-  state.buses = replayedBuses(dates);
-  if (replay.playing && replay.skipEmpty && !anyBusShown()) skipToNextDeparture(now, dates, tomorrow);
-  if (state.popupBusId && !state.buses.has(state.popupBusId)) state.popup.remove();
+const parisClock = new Intl.DateTimeFormat('en-GB', { timeZone: 'Europe/Paris', weekday: 'short', day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit' });
 
-  const clock = parisClock.format(replay.sim);
+function toInputValue(ms) {
+  return new Date(ms - new Date(ms).getTimezoneOffset() * 60000).toISOString().slice(0, 16);
+}
+
+function dayFor(date) {
+  if (!state.days.has(date)) state.days.set(date, dayOf(state.timetable, date));
+  return state.days.get(date);
+}
+
+function updateVehicles(days) {
+  const vehicles = new Map();
+  for (const v of vehiclesAt(state.timetable, state.shapes, days, state.sim)) {
+    const line = state.lines[v.profile.line];
+    vehicles.set(v.id, { id: v.id, lon: v.lon, lat: v.lat, bearing: v.bearing, line: line.key, short: line.short, color: line.color, text: line.text, headsign: v.profile.headsign });
+  }
+  state.vehicles = vehicles;
+}
+
+function shownVehicleCount() {
+  let count = 0;
+  for (const vehicle of state.vehicles.values()) if (state.selected.has(vehicle.line)) count++;
+  return count;
+}
+
+function skipToNextDeparture(now, days, tomorrow) {
+  const wanted = (profile) => state.selected.has(state.lines[profile.line].key);
+  const next = nextDeparture(state.timetable, [...days, tomorrow], state.sim, wanted);
+  if (next === null || next - state.sim < MIN_SKIP_MS) return;
+  state.sim = next + 1;
+  state.skipNote = `Skipped to ${parisClock.format(state.sim)}: nothing runs until then.`;
+  state.skipNoteUntil = now + SKIP_NOTE_MS;
+}
+
+function tick(now) {
+  const elapsed = Math.min(now - state.lastTick, 250);
+  state.lastTick = now;
+  if (state.playing) state.sim += elapsed * state.speed;
+
+  let today = serviceDateOf(state.sim);
+  let days = [dayFor(shiftYmd(today, -1)), dayFor(today)];
+  updateVehicles(days);
+  if (state.playing && state.skipEmpty && shownVehicleCount() === 0) {
+    skipToNextDeparture(now, days, dayFor(shiftYmd(today, 1)));
+    today = serviceDateOf(state.sim);
+    days = [dayFor(shiftYmd(today, -1)), dayFor(today)];
+    updateVehicles(days);
+  }
+  const keep = new Set([shiftYmd(today, -1), today, shiftYmd(today, 1)]);
+  for (const date of state.days.keys()) if (!keep.has(date)) state.days.delete(date);
+  if (state.popupVehicleId && !state.vehicles.has(state.popupVehicleId)) state.popup.remove();
+
+  const clock = parisClock.format(state.sim);
   if ($('replay-clock').textContent !== clock) {
     $('replay-clock').textContent = clock;
-    if (document.activeElement !== $('replay-at')) $('replay-at').value = toInputValue(replay.sim);
+    if (document.activeElement !== $('replay-at')) $('replay-at').value = toInputValue(state.sim);
   }
-  const count = [...state.buses.values()].filter((bus) => state.selected.has(bus.line)).length;
-  if (now < replay.skipNoteUntil) setStatusText(replay.skipNote);
-  else setStatusText(count ? `Replay: ${count} ${count === 1 ? 'bus' : 'buses'} on the road.` : 'Replay: no buses in the timetable at this time.');
+  const count = shownVehicleCount();
+  if (now < state.skipNoteUntil) setStatusText(state.skipNote);
+  else setStatusText(count ? `${count} ${count === 1 ? 'vehicle' : 'vehicles'} on the road.` : 'Nothing in the timetable at this time.');
 
-  const colourDue = now - replay.lastColour > 1000 && Math.abs(replay.sim - replay.lastColourSim) >= 30000;
-  if (colourDue && !replay.colouring) {
-    replay.lastColour = now;
-    replay.lastColourSim = replay.sim;
-    replay.colouring = true;
-    refreshService().finally(() => {
-      replay.colouring = false;
-    });
-  }
-}
-
-function setMode(mode) {
-  const replay = state.replay;
-  const on = mode === 'replay';
-  if (on === replay.on) return;
-  replay.on = on;
-  document.querySelectorAll('#mode-choice button').forEach((b) => b.setAttribute('aria-checked', String(b.dataset.mode === mode)));
-  $('replay').hidden = !on;
-  $('toggle-live-only').disabled = on;
-  state.popup?.remove();
-  state.buses = new Map();
-  if (on) {
-    replay.sim = replay.sim || Date.now();
-    replay.lastTick = performance.now();
-    replay.lastColourSim = -Infinity;
-    $('replay-at').value = toInputValue(replay.sim);
-  } else {
-    setStatusText('Loading live buses...');
-    refreshVehicles();
-    refreshService();
+  if (now - state.lastColour > COLOUR_EVERY_MS && Math.abs(state.sim - state.lastColourSim) >= COLOUR_MIN_SIM_MS) {
+    state.lastColour = now;
+    refreshColours();
   }
 }
 
 let lastFrame = 0;
 function frame(now) {
-  const frameGap = state.buses.size > BUSY_MAP_BUSES ? 66 : 33;
+  const frameGap = state.vehicles.size > BUSY_MAP_VEHICLES ? 66 : 33;
   if (!document.hidden && now - lastFrame > frameGap) {
     lastFrame = now;
-    if (state.replay.on) tickReplay(now);
-    drawBuses(now);
+    tick(now);
+    drawVehicles();
   }
   requestAnimationFrame(frame);
 }
@@ -537,8 +304,8 @@ function renderLines() {
 
 function linesChanged() {
   renderLines();
-  drawBuses(performance.now());
-  refreshService();
+  if (state.timetable) drawVehicles();
+  refreshColours();
 }
 
 function bindControls() {
@@ -548,36 +315,27 @@ function bindControls() {
     state.window = button.dataset.window;
     document.querySelectorAll('#window-choice button').forEach((b) => b.setAttribute('aria-checked', String(b === button)));
     applyColourScale();
-    refreshService();
-  });
-  $('mode-choice').addEventListener('click', (e) => {
-    const button = e.target.closest('button[data-mode]');
-    if (button) setMode(button.dataset.mode);
+    refreshColours();
   });
   $('replay-play').addEventListener('click', (e) => {
-    state.replay.playing = !state.replay.playing;
-    e.target.textContent = state.replay.playing ? 'Pause' : 'Play';
+    state.playing = !state.playing;
+    e.target.textContent = state.playing ? 'Pause' : 'Play';
   });
   $('replay-speed').addEventListener('change', (e) => {
-    state.replay.speed = Number(e.target.value);
+    state.speed = Number(e.target.value);
   });
   $('replay-skip').addEventListener('change', (e) => {
-    state.replay.skipEmpty = e.target.checked;
+    state.skipEmpty = e.target.checked;
   });
   $('replay-at').addEventListener('change', (e) => {
     const ms = new Date(e.target.value).getTime();
     if (Number.isNaN(ms)) return;
-    state.replay.sim = ms;
-    state.replay.lastColourSim = -Infinity;
+    state.sim = ms;
+    state.lastColourSim = -Infinity;
   });
   $('toggle-roads').addEventListener('change', (e) => setVisible(['roads-casing', 'roads'], e.target.checked));
   $('toggle-areas').addEventListener('change', (e) => setVisible(['areas'], e.target.checked));
-  $('toggle-buses').addEventListener('change', (e) => setVisible(['trails-casing', 'trails', 'bus-halos', 'bus-circles', 'bus-arrows', 'bus-labels'], e.target.checked));
-  $('toggle-live-only').addEventListener('change', (e) => {
-    state.liveOnly = e.target.checked;
-    drawBuses(performance.now());
-    if (state.latestVehicles) renderStatus(state.latestVehicles);
-  });
+  $('toggle-vehicles').addEventListener('change', (e) => setVisible(['vehicle-circles', 'vehicle-arrows', 'vehicle-labels'], e.target.checked));
   $('lines-all').addEventListener('click', () => {
     state.selected = new Set(state.lines.map((l) => l.key));
     linesChanged();
@@ -614,34 +372,38 @@ function bindControls() {
   });
 }
 
-function showPopup(lngLat, html, busId = null) {
+function showPopup(lngLat, html, vehicleId = null) {
   state.popup?.remove();
-  state.popup = new maplibregl.Popup({ closeButton: true, maxWidth: '280px', offset: busId ? 16 : 6 })
+  state.popup = new maplibregl.Popup({ closeButton: true, maxWidth: '280px', offset: vehicleId ? 16 : 6 })
     .setLngLat(lngLat)
     .setHTML(html)
     .addTo(map);
-  state.popupBusId = busId;
+  state.popupVehicleId = vehicleId;
   const popup = state.popup;
   popup.on('close', () => {
-    if (state.popup === popup) state.popupBusId = null;
+    if (state.popup === popup) state.popupVehicleId = null;
   });
 }
 
-async function showRoad(id, lngLat) {
-  const res = await fetch(`/api/piece/${id}?window=${state.window}${linesQuery()}${momentQuery()}`);
-  if (!res.ok) return;
-  const detail = await res.json();
+function showRoad(detail, lngLat) {
   const label = detail.total === 1 ? 'passage' : 'passages';
   const lines = detail.lines
-    .map(
-      (l) =>
-        `<span><span class="popup-line" style="background:${l.color};color:${l.text}">${escapeHtml(l.short)}</span> ${l.count}</span>`,
-    )
+    .map(({ line, count }) => {
+      const l = state.lines[line];
+      return `<span><span class="popup-line" style="background:${l.color};color:${l.text}">${escapeHtml(l.short)}</span> ${count}</span>`;
+    })
     .join('');
   showPopup(
     lngLat,
     `<div class="popup-title">${detail.total} ${label}</div><div class="popup-sub">${WINDOW_TEXT[state.window]}</div>${lines ? `<div class="popup-lines">${lines}</div>` : ''}`,
   );
+}
+
+function requestRoad(piece, lngLat) {
+  if (!state.workerReady) return;
+  const request = state.nextRoadRequest++;
+  state.roadRequests.set(request, lngLat);
+  state.worker.postMessage({ type: 'piece', request, piece, at: Math.round(state.sim), window: state.window, lines: selectedLineNumbers() });
 }
 
 function bindMapClicks() {
@@ -650,19 +412,42 @@ function bindMapClicks() {
     [p.x + r, p.y + r],
   ];
   map.on('click', (e) => {
-    const bus = map.queryRenderedFeatures(around(e.point, 4), { layers: ['bus-circles'] })[0];
-    if (bus) {
-      const data = state.buses.get(bus.properties.id);
-      if (data) showPopup([data.shownLon, data.shownLat], busPopupHtml(data), data.id);
+    const hit = map.queryRenderedFeatures(around(e.point, 4), { layers: ['vehicle-circles'] })[0];
+    if (hit) {
+      const vehicle = state.vehicles.get(hit.properties.id);
+      if (vehicle) showPopup([vehicle.lon, vehicle.lat], vehiclePopupHtml(vehicle), vehicle.id);
       return;
     }
     const road = map.queryRenderedFeatures(around(e.point, 6), { layers: ['roads'] })[0];
-    if (road) showRoad(road.id, e.lngLat);
+    if (road) requestRoad(road.id, e.lngLat);
   });
   map.on('mousemove', (e) => {
-    const hit = map.queryRenderedFeatures(around(e.point, 6), { layers: ['bus-circles', 'roads'] });
+    const hit = map.queryRenderedFeatures(around(e.point, 6), { layers: ['vehicle-circles', 'roads'] });
     map.getCanvas().style.cursor = hit.length ? 'pointer' : '';
   });
+}
+
+function decodeMap(raw) {
+  let lon = 0;
+  let lat = 0;
+  const roads = raw.roads.map((flat, id) => {
+    const coordinates = [];
+    for (let i = 0; i < flat.length; i += 2) {
+      lon += flat[i];
+      lat += flat[i + 1];
+      coordinates.push([lon / 1e5, lat / 1e5]);
+    }
+    return { type: 'Feature', id, properties: {}, geometry: { type: 'LineString', coordinates } };
+  });
+  let q = 0;
+  let r = 0;
+  const areas = raw.areas.q.map((stepQ, id) => {
+    q += stepQ;
+    r += raw.areas.r[id];
+    const ring = hexRing(q, r).map(([x, y]) => toLonLat(x, y).map((v) => Math.round(v * 1e5) / 1e5));
+    return { type: 'Feature', id, properties: {}, geometry: { type: 'Polygon', coordinates: [ring] } };
+  });
+  return { roads: { type: 'FeatureCollection', features: roads }, areas: { type: 'FeatureCollection', features: areas } };
 }
 
 function addLayers(network) {
@@ -672,9 +457,8 @@ function addLayers(network) {
   const firstSymbol = baseLayers[lastShape + 1]?.id;
   map.addSource('areas', { type: 'geojson', data: network.areas, buffer: 8 });
   map.addSource('roads', { type: 'geojson', data: network.roads, buffer: 8, tolerance: 0.2 });
-  map.addSource('buses', { type: 'geojson', data: { type: 'FeatureCollection', features: [] } });
-  map.addSource('trails', { type: 'geojson', data: { type: 'FeatureCollection', features: [] } });
-  map.addImage('bus-arrow', arrowImage());
+  map.addSource('vehicles', { type: 'geojson', data: { type: 'FeatureCollection', features: [] } });
+  map.addImage('vehicle-arrow', arrowImage());
 
   map.addLayer(
     {
@@ -713,34 +497,13 @@ function addLayers(network) {
     firstSymbol,
   );
 
-  const trailLayout = { 'line-cap': 'round', 'line-join': 'round' };
   map.addLayer({
-    id: 'trails-casing',
-    type: 'line',
-    source: 'trails',
-    layout: trailLayout,
-    paint: {
-      'line-color': '#0a0c11',
-      'line-width': ['interpolate', ['linear'], ['zoom'], 9, 3.5, 12, 6, 15, 9],
-    },
-  });
-  map.addLayer({
-    id: 'trails',
-    type: 'line',
-    source: 'trails',
-    layout: trailLayout,
-    paint: {
-      'line-color': ['get', 'colour'],
-      'line-width': ['interpolate', ['linear'], ['zoom'], 9, 1.5, 12, 3, 15, 5],
-    },
-  });
-  map.addLayer({
-    id: 'bus-arrows',
+    id: 'vehicle-arrows',
     type: 'symbol',
-    source: 'buses',
+    source: 'vehicles',
     minzoom: 11,
     layout: {
-      'icon-image': 'bus-arrow',
+      'icon-image': 'vehicle-arrow',
       'icon-size': ['interpolate', ['linear'], ['zoom'], 11, 0.55, 14, 0.8],
       'icon-rotate': ['get', 'bearing'],
       'icon-rotation-alignment': 'map',
@@ -749,32 +512,20 @@ function addLayers(network) {
     },
   });
   map.addLayer({
-    id: 'bus-halos',
+    id: 'vehicle-circles',
     type: 'circle',
-    source: 'buses',
-    filter: ['get', 'reported'],
-    paint: {
-      'circle-radius': ['interpolate', ['linear'], ['zoom'], 9, 7, 11, 12, 14, 17],
-      'circle-color': 'rgba(0,0,0,0)',
-      'circle-stroke-color': '#ffffff',
-      'circle-stroke-width': 1.5,
-    },
-  });
-  map.addLayer({
-    id: 'bus-circles',
-    type: 'circle',
-    source: 'buses',
+    source: 'vehicles',
     paint: {
       'circle-radius': ['interpolate', ['linear'], ['zoom'], 9, 4, 11, 8, 14, 12],
       'circle-color': ['get', 'fill'],
-      'circle-stroke-color': ['get', 'ring'],
-      'circle-stroke-width': ['interpolate', ['linear'], ['zoom'], 9, 1, 12, 2.5],
+      'circle-stroke-color': '#ffffff',
+      'circle-stroke-width': ['interpolate', ['linear'], ['zoom'], 9, 1, 12, 2],
     },
   });
   map.addLayer({
-    id: 'bus-labels',
+    id: 'vehicle-labels',
     type: 'symbol',
-    source: 'buses',
+    source: 'vehicles',
     minzoom: 11,
     layout: {
       'text-field': ['get', 'short'],
@@ -787,36 +538,51 @@ function addLayers(network) {
   });
 }
 
+function ymdToMs(ymd) {
+  return new Date(`${ymd.slice(0, 4)}-${ymd.slice(4, 6)}-${ymd.slice(6, 8)}T12:00`).getTime();
+}
+
 async function start() {
   const loaded = new Promise((resolve) => map.once('load', resolve));
-  const res = await fetch('/api/network');
-  if (!res.ok) throw new Error('The network could not be loaded.');
-  const network = await res.json();
-  state.lines = network.lines;
-  state.networks = network.networks;
+  const metaRes = await fetch('data/meta.json', { cache: 'no-cache' });
+  if (!metaRes.ok) throw new Error('The timetable data could not be loaded.');
+  const meta = await metaRes.json();
+  state.lines = meta.lines;
+  state.networks = meta.networks;
   state.selected = new Set(state.lines.map((l) => l.key));
+  renderLines();
+  renderLegend();
   const asInput = (ymd, time) => `${ymd.slice(0, 4)}-${ymd.slice(4, 6)}-${ymd.slice(6, 8)}T${time}`;
-  $('replay-at').min = asInput(network.timetable.from, '00:00');
-  $('replay-at').max = asInput(network.timetable.to, '23:59');
+  $('replay-at').min = asInput(meta.range.from, '00:00');
+  $('replay-at').max = asInput(meta.range.to, '23:59');
+  $('data-date').textContent = new Intl.DateTimeFormat('en-GB', { day: 'numeric', month: 'long', year: 'numeric' }).format(meta.version);
+  state.sim = Math.min(Math.max(Date.now(), ymdToMs(meta.range.from)), ymdToMs(meta.range.to));
+  $('replay-at').value = toInputValue(state.sim);
+
+  setStatusText('Downloading the timetables...');
+  const query = `?v=${meta.version}`;
+  const [mapData, timetable, shapes] = await Promise.all(
+    ['map', 'timetable', 'shapes'].map((name) => loadGz(`data/${name}.json.gz${query}`)),
+  );
+  state.timetable = decodeTimetable(timetable);
+  state.shapes = decodeShapes(shapes);
+  const network = decodeMap(mapData);
 
   await loaded;
   addLayers(network);
   applyColourScale();
-  renderLines();
   bindControls();
   bindMapClicks();
-  setMode('replay');
 
-  await Promise.all([refreshService(), refreshVehicles()]);
-  setInterval(refreshVehicles, VEHICLE_MS);
-  setInterval(() => {
-    if (!state.replay.on) refreshService();
-  }, SERVICE_MS);
+  state.worker = new Worker('colour-worker.js', { type: 'module' });
+  state.worker.onmessage = onWorkerMessage;
+  state.worker.postMessage({ type: 'init', version: meta.version, counts: meta.counts, lineCount: state.lines.length });
+
+  state.lastTick = performance.now();
   requestAnimationFrame(frame);
 }
 
 start().catch((err) => {
   console.error(err);
-  $('status').textContent = 'The map could not start. Is the local server running?';
-  $('status').classList.add('warn');
+  setStatusText('The map could not start. Try reloading the page.', true);
 });

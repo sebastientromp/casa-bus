@@ -98,10 +98,6 @@ section {
   font-weight: 600;
 }
 
-.segmented.two {
-  grid-template-columns: repeat(2, 1fr);
-}
-
 .replay {
   margin-top: 10px;
 }
@@ -218,50 +214,6 @@ input:focus-visible {
   align-items: center;
   gap: 5px;
   cursor: pointer;
-}
-
-.key {
-  list-style: none;
-  margin: 0;
-  padding: 0;
-  font-size: 13px;
-  color: var(--ink-2);
-}
-
-.key li {
-  display: flex;
-  gap: 8px;
-  margin-top: 6px;
-}
-
-.key strong {
-  color: var(--ink);
-}
-
-.dot {
-  flex: none;
-  width: 14px;
-  height: 14px;
-  border-radius: 50%;
-  border: 3px solid #d9dee8;
-  margin-top: 2px;
-}
-
-.dot.live {
-  background: #d9dee8;
-}
-
-.dot.reported {
-  width: 10px;
-  height: 10px;
-  border: 0;
-  margin: 4px 2px 0;
-  background: #d9dee8;
-  box-shadow: 0 0 0 1.5px var(--surface), 0 0 0 3px #d9dee8;
-}
-
-.dot.scheduled {
-  background: var(--surface);
 }
 
 .section-head {

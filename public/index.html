@@ -4,24 +4,19 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>Valbonne Bus Map</title>
-    <link rel="stylesheet" href="/vendor/maplibre-gl.css" />
-    <link rel="stylesheet" href="/style.css" />
+    <link rel="stylesheet" href="vendor/maplibre-gl.css" />
+    <link rel="stylesheet" href="style.css" />
   </head>
   <body>
-    <div id="map" role="application" aria-label="Map of buses around Valbonne"></div>
+    <div id="map" role="application" aria-label="Map of buses and trams in the Alpes-Maritimes"></div>
 
     <aside class="panel" aria-label="Map controls">
       <header>
-        <h1>Valbonne buses</h1>
+        <h1>Buses of the 06</h1>
         <p id="status" class="status" role="status">Loading the network...</p>
       </header>
 
       <section>
-        <h2 id="mode-label">Time</h2>
-        <div class="segmented two" id="mode-choice" role="radiogroup" aria-labelledby="mode-label">
-          <button type="button" role="radio" data-mode="live" aria-checked="false">Live</button>
-          <button type="button" role="radio" data-mode="replay" aria-checked="true">Replay</button>
-        </div>
         <div class="replay" id="replay">
           <p class="clock" id="replay-clock" aria-live="off"></p>
           <div class="replay-row">
@@ -40,15 +35,15 @@
           <label class="replay-at">Date and time
             <input type="datetime-local" id="replay-at" step="60" />
           </label>
-          <label class="replay-skip"><input type="checkbox" id="replay-skip" checked /> Skip times with no buses</label>
-          <p class="note">Timetable only, so no real delays. All buses show as scheduled.</p>
+          <label class="replay-skip"><input type="checkbox" id="replay-skip" checked /> Skip times with nothing running</label>
+          <p class="note">Positions come from the published timetables (updated <span id="data-date"></span>), not from real vehicles.</p>
         </div>
       </section>
 
       <section>
         <h2 id="window-label">Colour roads by passages</h2>
         <div class="segmented" id="window-choice" role="radiogroup" aria-labelledby="window-label">
-          <button type="button" role="radio" data-window="today" aria-checked="true">Today so far</button>
+          <button type="button" role="radio" data-window="today" aria-checked="true">Day so far</button>
           <button type="button" role="radio" data-window="hour" aria-checked="false">Last hour</button>
           <button type="button" role="radio" data-window="full" aria-checked="false">Full day</button>
         </div>
@@ -63,21 +58,8 @@
         <div class="toggles">
           <label><input type="checkbox" id="toggle-roads" checked /> Roads</label>
           <label><input type="checkbox" id="toggle-areas" checked /> Areas</label>
-          <label><input type="checkbox" id="toggle-buses" checked /> Buses</label>
+          <label><input type="checkbox" id="toggle-vehicles" checked /> Vehicles</label>
         </div>
-      </section>
-
-      <section>
-        <h2>Buses</h2>
-        <div class="toggles">
-          <label><input type="checkbox" id="toggle-live-only" /> Live buses only</label>
-        </div>
-        <ul class="key">
-          <li><span class="dot reported"></span><span><strong>Reported:</strong> position sent by a vehicle feed (<span id="reported-count">none right now</span>)</span></li>
-          <li><span class="dot live"></span><span><strong>Live:</strong> timetable corrected with the delay the network reports</span></li>
-          <li><span class="dot scheduled"></span><span><strong>Scheduled:</strong> where the timetable says it should be; real position unknown</span></li>
-        </ul>
-        <p class="note">The line behind a live bus is its last 2 minutes of travel.</p>
       </section>
 
       <section>
@@ -90,7 +72,7 @@
       </section>
     </aside>
 
-    <script src="/vendor/maplibre-gl.js"></script>
-    <script type="module" src="/app.js"></script>
+    <script src="vendor/maplibre-gl.js"></script>
+    <script type="module" src="app.js"></script>
   </body>
 </html>

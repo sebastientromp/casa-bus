@@ -2,17 +2,17 @@
   "name": "valbonne-bus-map",
   "version": "1.0.0",
   "private": true,
-  "description": "Map of the buses around Valbonne, coloured by how much service each road and area gets.",
+  "description": "Replay of every bus and tram timetable in the Alpes-Maritimes, as a static site.",
   "type": "module",
   "engines": {
     "node": ">=22"
   },
   "scripts": {
-    "start": "node server/index.js",
-    "test": "node --test"
+    "start": "node build/serve.js",
+    "test": "node --test",
+    "build": "node build/build.js"
   },
   "dependencies": {
-    "gtfs-realtime-bindings": "^1.1.1",
     "maplibre-gl": "^4.7.1"
   }
 }
