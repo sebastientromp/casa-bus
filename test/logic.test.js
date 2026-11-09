@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { deflateRawSync } from 'node:zlib';
 import { encodeAreas, encodeMap, encodeShapes, encodeTimetable, encodeVisits } from '../build/encode.js';
-import { fillMissingTimes, inAlpesMaritimes, isServiceActive, isShownRoute, parseCsv, parseTime, serviceOrigin, timetableRange } from '../build/gtfs.js';
+import { fillMissingTimes, inAlpesMaritimes, isServiceActive, isShownRoute, newestArchiveUrl, parseCsv, parseTime, serviceOrigin, timetableRange } from '../build/gtfs.js';
 import { buildHexes, buildPieces, cruiseProfile } from '../build/network.js';
 import { readZip } from '../build/zip.js';
 import { buildDayEvents, decodeAreas, decodeVisits, pieceDetail, score, windowRange } from '../public/colouring.js';
@@ -69,6 +69,19 @@ test('timetableRange spans rules and added dates', () => {
     ['a', { rules: new Map([['s', { start: '20261101', end: '20261201' }]]), exceptions: new Map([['x:20270105', 1], ['x:20200101', 2]]) }],
   ]);
   assert.deepEqual(timetableRange({ calendars }), { from: '20261101', to: '20270105' });
+});
+
+test('newestArchiveUrl picks the latest copy of the right file', () => {
+  const entry = (when, permanent_url, resource_url = 'source', format = 'GTFS') => ({ payload: { format, resource_url, permanent_url, download_datetime: when } });
+  const history = [
+    entry('2026-10-01T06:00:00Z', 'old'),
+    entry('2026-11-03T06:00:00Z', 'new'),
+    entry('2026-11-05T06:00:00Z', 'other file', 'elsewhere'),
+    entry('2026-11-06T06:00:00Z', 'not gtfs', 'source', 'NeTEx'),
+    { payload: {} },
+  ];
+  assert.equal(newestArchiveUrl(history, 'source'), 'new');
+  assert.equal(newestArchiveUrl(history, 'unknown'), null);
 });
 
 test('fillMissingTimes interpolates by distance', () => {

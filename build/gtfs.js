@@ -11,6 +11,8 @@ export const NETWORKS = [
     id: 'envibus',
     label: 'Envibus',
     gtfs: 'https://open-share.agglo-casa.fr/s/34FS2SWg36NEZk4/download',
+    // This server doesn't answer GitHub's build machines, so the national portal's copy is the fallback.
+    archiveDataset: '5be2ce698b4c414a99f9d84c',
     licence: 'ODbL',
   },
   {
@@ -208,6 +210,35 @@ function lineColor(raw) {
     : '#8a93a6';
 }
 
+const CLIENT_HEADERS = { 'user-agent': 'valbonne-bus-map' };
+
+async function downloadGtfs(url) {
+  const res = await fetch(url, { headers: CLIENT_HEADERS, signal: AbortSignal.timeout(120_000) });
+  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  const bytes = new Uint8Array(await res.arrayBuffer());
+  if (!readZip(bytes, ['routes.txt'])['routes.txt']) throw new Error('not a GTFS archive');
+  return bytes;
+}
+
+/** The address of the most recent copy the national portal has kept of a timetable file. */
+export function newestArchiveUrl(history, sourceUrl) {
+  const copies = history
+    .filter((entry) => entry.payload?.format === 'GTFS' && entry.payload.resource_url === sourceUrl && entry.payload.permanent_url)
+    .sort((a, b) => b.payload.download_datetime.localeCompare(a.payload.download_datetime));
+  return copies[0]?.payload.permanent_url ?? null;
+}
+
+async function downloadArchive(net) {
+  const url = `https://transport.data.gouv.fr/api/datasets/${net.archiveDataset}`;
+  const res = await fetch(url, { headers: CLIENT_HEADERS, signal: AbortSignal.timeout(60_000) });
+  if (!res.ok) throw new Error(`portal HTTP ${res.status}`);
+  const archive = newestArchiveUrl((await res.json()).history ?? [], net.gtfs);
+  if (!archive) throw new Error('no archived copy');
+  return downloadGtfs(archive);
+}
+
+const reason = (err) => [err.message, err.cause?.code ?? err.cause?.message].filter(Boolean).join(': ');
+
 /** Downloads any timetable that is missing or older than a day; a failed refresh keeps the last copy. */
 export async function ensureFeeds(dataDir, log = console.log) {
   mkdirSync(dataDir, { recursive: true });
@@ -215,20 +246,21 @@ export async function ensureFeeds(dataDir, log = console.log) {
     const file = join(dataDir, `${net.id}.zip`);
     const fresh = existsSync(file) && Date.now() - statSync(file).mtimeMs < ONE_DAY;
     if (fresh) continue;
+    log(`Downloading ${net.label} timetable...`);
     try {
-      log(`Downloading ${net.label} timetable...`);
-      const res = await fetch(net.gtfs, {
-        headers: { 'user-agent': 'valbonne-bus-map' },
-        signal: AbortSignal.timeout(120_000),
-      });
-      if (!res.ok) throw new Error(`HTTP ${res.status}`);
-      const bytes = new Uint8Array(await res.arrayBuffer());
-      if (!readZip(bytes, ['routes.txt'])['routes.txt']) throw new Error('not a GTFS archive');
+      let bytes;
+      try {
+        bytes = await downloadGtfs(net.gtfs);
+      } catch (err) {
+        if (!net.archiveDataset) throw err;
+        log(`${net.label} source failed (${reason(err)}); using the national portal's copy.`);
+        bytes = await downloadArchive(net);
+      }
       writeFileSync(file, bytes);
     } catch (err) {
       log(existsSync(file)
-        ? `Could not refresh ${net.label} (${err.message}); using the previous copy.`
-        : `Could not download ${net.label} (${err.message}); it will be missing from the map.`);
+        ? `Could not refresh ${net.label} (${reason(err)}); using the previous copy.`
+        : `Could not download ${net.label} (${reason(err)}); it will be missing from the map.`);
     }
   }
 }
